@@ -66,6 +66,7 @@ config file at runtime.
     - [`Gateway.DisableHTMLErrors`](#gatewaydisablehtmlerrors)
     - [`Gateway.ExposeRoutingAPI`](#gatewayexposeroutingapi)
     - [`Gateway.RetrievalTimeout`](#gatewayretrievaltimeout)
+    - [`Gateway.MaxRangeRequestFileSize`](#gatewaymaxrangerequestfilesize)
     - [`Gateway.MaxConcurrentRequests`](#gatewaymaxconcurrentrequests)
     - [`Gateway.HTTPHeaders`](#gatewayhttpheaders)
     - [`Gateway.RootRedirect`](#gatewayrootredirect)
@@ -132,6 +133,7 @@ config file at runtime.
       - [`Provide.DHT.MaxWorkers`](#providedhtmaxworkers)
       - [`Provide.DHT.Interval`](#providedhtinterval)
       - [`Provide.DHT.SweepEnabled`](#providedhtsweepenabled)
+      - [`Provide.DHT.ResumeEnabled`](#providedhtresumeenabled)
       - [`Provide.DHT.DedicatedPeriodicWorkers`](#providedhtdedicatedperiodicworkers)
       - [`Provide.DHT.DedicatedBurstWorkers`](#providedhtdedicatedburstworkers)
       - [`Provide.DHT.MaxProvideConnsPerWorker`](#providedhtmaxprovideconnsperworker)
@@ -228,6 +230,8 @@ config file at runtime.
     - [`Import.UnixFSRawLeaves`](#importunixfsrawleaves)
     - [`Import.UnixFSChunker`](#importunixfschunker)
     - [`Import.HashFunction`](#importhashfunction)
+    - [`Import.FastProvideRoot`](#importfastprovideroot)
+    - [`Import.FastProvideWait`](#importfastprovidewait)
     - [`Import.BatchMaxNodes`](#importbatchmaxnodes)
     - [`Import.BatchMaxSize`](#importbatchmaxsize)
     - [`Import.UnixFSFileMaxLinks`](#importunixfsfilemaxlinks)
@@ -1124,7 +1128,7 @@ Kubo will filter out routing results which are not actionable, for example, all
 graphsync providers will be skipped. If you need a generic pass-through, see
 standalone router implementation named [someguy](https://github.com/ipfs/someguy).
 
-Default: `false`
+Default: `true`
 
 Type: `flag`
 
@@ -1157,6 +1161,27 @@ A value of 0 disables this timeout.
 Default: `30s`
 
 Type: `optionalDuration`
+
+### `Gateway.MaxRangeRequestFileSize`
+
+Maximum file size for HTTP range requests on deserialized responses. Range requests for files larger than this limit return 501 Not Implemented.
+
+**Why this exists:**
+
+Some CDNs like Cloudflare intercept HTTP range requests and convert them to full file downloads when files exceed their cache bucket limits. Cloudflare's default plan only caches range requests for files up to 5GiB. Files larger than this receive HTTP 200 with the entire file instead of HTTP 206 with the requested byte range. A client requesting 1MB from a 40GiB file would unknowingly download all 40GiB, causing bandwidth overcharges for the gateway operator, unexpected data costs for the client, and potential browser crashes.
+
+This only affects deserialized responses. Clients fetching verifiable blocks as `application/vnd.ipld.raw` are not impacted because they work with small chunks that stay well below CDN cache limits.
+
+**How to use:**
+
+Set this to your CDN's range request cache limit (e.g., `"5GiB"` for Cloudflare's default plan). The gateway returns 501 Not Implemented for range requests over files larger than this limit, with an error message suggesting verifiable block requests as an alternative.
+
+> [!NOTE]
+> Cloudflare users running open gateway hosting deserialized responses should deploy additional protection via Cloudflare Snippets (requires Enterprise plan). The Kubo configuration alone is not sufficient because Cloudflare has already intercepted and cached the response by the time it reaches your origin. See [boxo#856](https://github.com/ipfs/boxo/issues/856#issuecomment-3523944976) for a snippet that aborts HTTP 200 responses when Content-Length exceeds the limit.
+
+Default: `0` (no limit)
+
+Type: [`optionalBytes`](#optionalbytes)
 
 ### `Gateway.MaxConcurrentRequests`
 
@@ -1920,7 +1945,7 @@ map CIDs to your peer ID, enabling content discovery across the network.
 While designed to support multiple routing systems in the future, the current
 default configuration only supports [providing to the Amino DHT](#providedht).
 
-<!-- TODO: See the [Reprovide Sweep blog post](https://blog.ipfs.tech/2025-reprovide-sweep/) for detailed performance comparisons. -->
+<!-- TODO: See the [Reprovide Sweep blog post](https://github.com/ipshipyard/ipshipyard.com/pull/8) for detailed performance comparisons. -->
 
 ### `Provide.Enabled`
 
@@ -2026,8 +2051,8 @@ overwhelming the network with unnecessary announcements.
 **With sweep mode enabled
 ([`Provide.DHT.SweepEnabled`](#providedhtsweepenabled)):** The system spreads
 reprovide operations smoothly across this entire interval. Each keyspace region
-is reprovided at scheduled times throughout the period, ensuring announcements
-periodically happen every interval.
+is reprovided at scheduled times throughout the period, ensuring each region's
+announcements complete before records expire.
 
 **With legacy mode:** The system attempts to reprovide all CIDs as quickly as
 possible at the start of each interval. If reproviding takes longer than this
@@ -2139,6 +2164,17 @@ gets batched by keyspace region. The keystore is periodically refreshed at each
 [`Provide.Strategy`](#providestrategy) to ensure only current content remains
 scheduled. This handles cases where content is unpinned or removed.
 
+**Persistent reprovide cycle state:** When Provide Sweep is enabled, the
+reprovide cycle state is persisted to the datastore by default. On restart, Kubo
+automatically resumes from where it left off. If the node was offline for an
+extended period, all CIDs that haven't been reprovided within the configured
+[`Provide.DHT.Interval`](#providedhtinterval) are immediately queued for
+reproviding. Additionally, the provide queue is persisted on shutdown and
+restored on startup, ensuring no pending provide operations are lost. If you
+don't want to keep the persisted provider state from a previous run, you can
+disable this behavior by setting [`Provide.DHT.ResumeEnabled`](#providedhtresumeenabled)
+to `false`.
+
 > <picture>
 >   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/f6e06b08-7fee-490c-a681-1bf440e16e27">
 >   <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/e1662d7c-f1be-4275-a9ed-f2752fcdcabe">
@@ -2156,16 +2192,48 @@ scheduled. This handles cases where content is unpinned or removed.
 You can compare the effectiveness of sweep mode vs legacy mode by monitoring the appropriate metrics (see [Monitoring Provide Operations](#monitoring-provide-operations) above).
 
 > [!NOTE]
-> This feature is opt-in for now, but will become the default in a future release.
-> Eventually, this configuration flag will be removed once the feature is stable.
+> This is the default provider system as of Kubo v0.39. To use the legacy provider instead, set `Provide.DHT.SweepEnabled=false`.
 
-Default: `false`
+Default: `true`
+
+Type: `flag`
+
+#### `Provide.DHT.ResumeEnabled`
+
+Controls whether the provider resumes from its previous state on restart. Only
+applies when `Provide.DHT.SweepEnabled` is true.
+
+When enabled (the default), the provider persists its reprovide cycle state and
+provide queue to the datastore, and restores them on restart. This ensures:
+
+- The reprovide cycle continues from where it left off instead of starting over
+- Any CIDs in the provide queue during shutdown are restored and provided after
+restart
+- CIDs that missed their reprovide window while the node was offline are queued
+for immediate reproviding
+
+When disabled, the provider starts fresh on each restart, discarding any
+previous reprovide cycle state and provide queue. On a fresh start, all CIDs
+matching the [`Provide.Strategy`](#providestrategy) will be provided ASAP (as
+burst provides), and then keyspace regions are reprovided according to the
+regular schedule starting from the beginning of the reprovide cycle.
+
+> [!NOTE]
+> Disabling this option means the provider will provide all content matching
+> your strategy on every restart (which can be resource-intensive for large
+> datasets), then start from the beginning of the reprovide cycle. For nodes
+> with large datasets or frequent restarts, keeping this enabled (the default)
+> is recommended for better resource efficiency and more consistent reproviding
+> behavior.
+
+Default: `true`
 
 Type: `flag`
 
 #### `Provide.DHT.DedicatedPeriodicWorkers`
 
-Number of workers dedicated to periodic keyspace region reprovides. Only applies when `Provide.DHT.SweepEnabled` is true.
+Number of workers dedicated to periodic keyspace region reprovides. Only
+applies when `Provide.DHT.SweepEnabled` is true.
 
 Among the [`Provide.DHT.MaxWorkers`](#providedhtmaxworkers), this
 number of workers will be dedicated to the periodic region reprovide only. The sum of
@@ -3100,7 +3168,7 @@ It is possible to inspect the runtime limits via `ipfs swarm resources --help`.
 > To set memory limit for the entire Kubo process, use [`GOMEMLIMIT` environment variable](http://web.archive.org/web/20240222201412/https://kupczynski.info/posts/go-container-aware/) which all Go programs recognize, and then set `Swarm.ResourceMgr.MaxMemory` to less than your custom `GOMEMLIMIT`.
 
 Default: `[TOTAL_SYSTEM_MEMORY]/2`
-Type: `optionalBytes`
+Type: [`optionalBytes`](#optionalbytes)
 
 #### `Swarm.ResourceMgr.MaxFileDescriptors`
 
@@ -3553,6 +3621,38 @@ Default: `sha2-256`
 
 Type: `optionalString`
 
+### `Import.FastProvideRoot`
+
+Immediately provide root CIDs to the DHT in addition to the regular provide queue.
+
+This complements the sweep provider system: fast-provide handles the urgent case (root CIDs that users share and reference), while the sweep provider efficiently provides all blocks according to the `Provide.Strategy` over time. Together, they optimize for both immediate discoverability of newly imported content and efficient resource usage for complete DAG provides.
+
+When disabled, only the sweep provider's queue is used.
+
+This setting applies to both `ipfs add` and `ipfs dag import` commands and can be overridden per-command with the `--fast-provide-root` flag.
+
+Ignored when DHT is not available for routing (e.g., `Routing.Type=none` or delegated-only configurations).
+
+Default: `true`
+
+Type: `flag`
+
+### `Import.FastProvideWait`
+
+Wait for the immediate root CID provide to complete before returning.
+
+When enabled, the command blocks until the provide completes, ensuring guaranteed discoverability before returning. When disabled (default), the provide happens asynchronously in the background without blocking the command.
+
+Use this when you need certainty that content is discoverable before the command returns (e.g., sharing a link immediately after adding).
+
+This setting applies to both `ipfs add` and `ipfs dag import` commands and can be overridden per-command with the `--fast-provide-wait` flag.
+
+Ignored when DHT is not available for routing (e.g., `Routing.Type=none` or delegated-only configurations).
+
+Default: `false`
+
+Type: `flag`
+
 ### `Import.BatchMaxNodes`
 
 The maximum number of nodes in a write-batch. The total size of the batch is limited by `BatchMaxnodes` and `BatchMaxSize`.
@@ -3653,7 +3753,7 @@ Commands affected: `ipfs add`, `ipfs daemon` (globally overrides [`boxo/ipld/uni
 
 Default: `256KiB` (may change, inspect `DefaultUnixFSHAMTDirectorySizeThreshold` to confirm)
 
-Type: `optionalBytes`
+Type: [`optionalBytes`](#optionalbytes)
 
 ## `Version`
 
@@ -3970,6 +4070,7 @@ an implicit default when missing from the config file:
 - a string value indicating the number of bytes, including human readable representations:
   - [SI sizes](https://en.wikipedia.org/wiki/Metric_prefix#List_of_SI_prefixes) (metric units, powers of 1000), e.g. `1B`, `2kB`, `3MB`, `4GB`, `5TB`, …)
   - [IEC sizes](https://en.wikipedia.org/wiki/Binary_prefix#IEC_prefixes) (binary units, powers of 1024), e.g. `1B`, `2KiB`, `3MiB`, `4GiB`, `5TiB`, …)
+- a raw number (will be interpreted as bytes, e.g. `1048576` for 1MiB)
 
 ### `optionalString`
 

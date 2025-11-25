@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	boxoprovider "github.com/ipfs/boxo/provider"
+	cid "github.com/ipfs/go-cid"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	"github.com/ipfs/kubo/core/commands/cmdenv"
 	"github.com/libp2p/go-libp2p-kad-dht/fullrt"
@@ -18,6 +20,7 @@ import (
 	"github.com/libp2p/go-libp2p-kad-dht/provider/buffered"
 	"github.com/libp2p/go-libp2p-kad-dht/provider/dual"
 	"github.com/libp2p/go-libp2p-kad-dht/provider/stats"
+	routing "github.com/libp2p/go-libp2p/core/routing"
 	"github.com/probe-lab/go-libdht/kad/key"
 	"golang.org/x/exp/constraints"
 )
@@ -348,6 +351,7 @@ NOTES:
 			}
 			sectionTitle := func(col int, title string) {
 				if !brief && showHeadings {
+					//nolint:govet // dynamic format string is intentional
 					formatLine(col, title+":")
 				}
 			}
@@ -372,8 +376,8 @@ NOTES:
 			// Queues
 			if all || queues || brief {
 				sectionTitle(1, "Queues")
-				formatLine(1, "%sProvide queue: %s CIDs, %s regions", indent, humanNumber(s.Sweep.Queues.PendingKeyProvides), humanNumber(s.Sweep.Queues.PendingRegionProvides))
-				formatLine(1, "%sReprovide queue: %s regions", indent, humanNumber(s.Sweep.Queues.PendingRegionReprovides))
+				formatLine(1, "%sProvide queue: %s CIDs, %s regions", indent, humanSI(s.Sweep.Queues.PendingKeyProvides, 1), humanSI(s.Sweep.Queues.PendingRegionProvides, 1))
+				formatLine(1, "%sReprovide queue: %s regions", indent, humanSI(s.Sweep.Queues.PendingRegionReprovides, 1))
 				addBlankLine(1)
 			}
 
@@ -413,12 +417,12 @@ NOTES:
 				sectionTitle(0, "Network")
 				formatLine(0, "%sAvg record holders: %s", indent, humanFloatOrNA(s.Sweep.Network.AvgHolders))
 				if !brief {
-					formatLine(0, "%sPeers swept: %s", indent, humanNumber(s.Sweep.Network.Peers))
+					formatLine(0, "%sPeers swept: %s", indent, humanInt(s.Sweep.Network.Peers))
 					formatLine(0, "%sFull keyspace coverage: %t", indent, s.Sweep.Network.CompleteKeyspaceCoverage)
 					if s.Sweep.Network.Peers > 0 {
-						formatLine(0, "%sReachable peers: %s (%s%%)", indent, humanNumber(s.Sweep.Network.Reachable), humanNumber(100*s.Sweep.Network.Reachable/s.Sweep.Network.Peers))
+						formatLine(0, "%sReachable peers: %s (%s%%)", indent, humanInt(s.Sweep.Network.Reachable), humanNumber(100*s.Sweep.Network.Reachable/s.Sweep.Network.Peers))
 					} else {
-						formatLine(0, "%sReachable peers: %s", indent, humanNumber(s.Sweep.Network.Reachable))
+						formatLine(0, "%sReachable peers: %s", indent, humanInt(s.Sweep.Network.Reachable))
 					}
 					formatLine(0, "%sAvg region size: %s", indent, humanFloatOrNA(s.Sweep.Network.AvgRegionSize))
 					formatLine(0, "%sReplication factor: %s", indent, humanNumber(s.Sweep.Network.ReplicationFactor))
@@ -430,15 +434,15 @@ NOTES:
 			if all || operations || brief {
 				sectionTitle(1, "Operations")
 				// Ongoing operations
-				formatLine(1, "%sOngoing provides: %s CIDs, %s regions", indent, humanNumber(s.Sweep.Operations.Ongoing.KeyProvides), humanNumber(s.Sweep.Operations.Ongoing.RegionProvides))
-				formatLine(1, "%sOngoing reprovides: %s CIDs, %s regions", indent, humanNumber(s.Sweep.Operations.Ongoing.KeyReprovides), humanNumber(s.Sweep.Operations.Ongoing.RegionReprovides))
+				formatLine(1, "%sOngoing provides: %s CIDs, %s regions", indent, humanSI(s.Sweep.Operations.Ongoing.KeyProvides, 1), humanSI(s.Sweep.Operations.Ongoing.RegionProvides, 1))
+				formatLine(1, "%sOngoing reprovides: %s CIDs, %s regions", indent, humanSI(s.Sweep.Operations.Ongoing.KeyReprovides, 1), humanSI(s.Sweep.Operations.Ongoing.RegionReprovides, 1))
 				// Past operations summary
 				formatLine(1, "%sTotal CIDs provided: %s", indent, humanNumber(s.Sweep.Operations.Past.KeysProvided))
 				if !brief {
 					formatLine(1, "%sTotal records provided: %s", indent, humanNumber(s.Sweep.Operations.Past.RecordsProvided))
 					formatLine(1, "%sTotal provide errors: %s", indent, humanNumber(s.Sweep.Operations.Past.KeysFailed))
-					formatLine(1, "%sCIDs provided/min: %s", indent, humanFloatOrNA(s.Sweep.Operations.Past.KeysProvidedPerMinute))
-					formatLine(1, "%sCIDs reprovided/min: %s", indent, humanFloatOrNA(s.Sweep.Operations.Past.KeysReprovidedPerMinute))
+					formatLine(1, "%sCIDs provided/min/worker: %s", indent, humanFloatOrNA(s.Sweep.Operations.Past.KeysProvidedPerMinute))
+					formatLine(1, "%sCIDs reprovided/min/worker: %s", indent, humanFloatOrNA(s.Sweep.Operations.Past.KeysReprovidedPerMinute))
 					formatLine(1, "%sRegion reprovide duration: %s", indent, humanDurationOrNA(s.Sweep.Operations.Past.RegionReprovideDuration))
 					formatLine(1, "%sAvg CIDs/reprovide: %s", indent, humanFloatOrNA(s.Sweep.Operations.Past.AvgKeysPerReprovide))
 					formatLine(1, "%sRegions reprovided (last cycle): %s", indent, humanNumber(s.Sweep.Operations.Past.RegionReprovidedLastCycle))
@@ -451,7 +455,7 @@ NOTES:
 			if displayWorkers || brief {
 				availableReservedBurst := max(0, s.Sweep.Workers.DedicatedBurst-s.Sweep.Workers.ActiveBurst)
 				availableReservedPeriodic := max(0, s.Sweep.Workers.DedicatedPeriodic-s.Sweep.Workers.ActivePeriodic)
-				availableFreeWorkers := s.Sweep.Workers.Max - max(s.Sweep.Workers.DedicatedBurst, s.Sweep.Workers.ActiveBurst) - max(s.Sweep.Workers.DedicatedPeriodic, s.Sweep.Workers.ActivePeriodic)
+				availableFreeWorkers := max(0, s.Sweep.Workers.Max-max(s.Sweep.Workers.DedicatedBurst, s.Sweep.Workers.ActiveBurst)-max(s.Sweep.Workers.DedicatedPeriodic, s.Sweep.Workers.ActivePeriodic))
 				availableBurst := availableFreeWorkers + availableReservedBurst
 				availablePeriodic := availableFreeWorkers + availableReservedPeriodic
 
@@ -463,21 +467,21 @@ NOTES:
 					if compactMode {
 						specifyWorkers = ""
 					}
-					formatLine(0, "%sActive%s: %s / %s (max)", indent, specifyWorkers, humanNumber(s.Sweep.Workers.Active), humanNumber(s.Sweep.Workers.Max))
+					formatLine(0, "%sActive%s: %s / %s (max)", indent, specifyWorkers, humanInt(s.Sweep.Workers.Active), humanInt(s.Sweep.Workers.Max))
 					if brief {
 						// Brief mode - show condensed worker info
 						formatLine(0, "%sPeriodic%s: %s active, %s available, %s queued", indent, specifyWorkers,
-							humanNumber(s.Sweep.Workers.ActivePeriodic), humanNumber(availablePeriodic), humanNumber(s.Sweep.Workers.QueuedPeriodic))
+							humanInt(s.Sweep.Workers.ActivePeriodic), humanInt(availablePeriodic), humanInt(s.Sweep.Workers.QueuedPeriodic))
 						formatLine(0, "%sBurst%s: %s active, %s available, %s queued\n", indent, specifyWorkers,
-							humanNumber(s.Sweep.Workers.ActiveBurst), humanNumber(availableBurst), humanNumber(s.Sweep.Workers.QueuedBurst))
+							humanInt(s.Sweep.Workers.ActiveBurst), humanInt(availableBurst), humanInt(s.Sweep.Workers.QueuedBurst))
 					} else {
-						formatLine(0, "%sFree%s: %s", indent, specifyWorkers, humanNumber(availableFreeWorkers))
-						formatLine(0, "%sWorkers stats:%s  %-9s %s", indent, "  ", "Periodic", "Burst")
-						formatLine(0, "%s  %-14s %-9s %s", indent, "Active:", humanNumber(s.Sweep.Workers.ActivePeriodic), humanNumber(s.Sweep.Workers.ActiveBurst))
-						formatLine(0, "%s  %-14s %-9s %s", indent, "Dedicated:", humanNumber(s.Sweep.Workers.DedicatedPeriodic), humanNumber(s.Sweep.Workers.DedicatedBurst))
-						formatLine(0, "%s  %-14s %-9s %s", indent, "Available:", humanNumber(availablePeriodic), humanNumber(availableBurst))
-						formatLine(0, "%s  %-14s %-9s %s", indent, "Queued:", humanNumber(s.Sweep.Workers.QueuedPeriodic), humanNumber(s.Sweep.Workers.QueuedBurst))
-						formatLine(0, "%sMax connections/worker: %s", indent, humanNumber(s.Sweep.Workers.MaxProvideConnsPerWorker))
+						formatLine(0, "%sFree%s: %s", indent, specifyWorkers, humanInt(availableFreeWorkers))
+						formatLine(0, "%s  %-14s %-9s %s", indent, "Workers stats:", "Periodic", "Burst")
+						formatLine(0, "%s  %-14s %-9s %s", indent, "Active:", humanInt(s.Sweep.Workers.ActivePeriodic), humanInt(s.Sweep.Workers.ActiveBurst))
+						formatLine(0, "%s  %-14s %-9s %s", indent, "Dedicated:", humanInt(s.Sweep.Workers.DedicatedPeriodic), humanInt(s.Sweep.Workers.DedicatedBurst))
+						formatLine(0, "%s  %-14s %-9s %s", indent, "Available:", humanInt(availablePeriodic), humanInt(availableBurst))
+						formatLine(0, "%s  %-14s %-9s %s", indent, "Queued:", humanInt(s.Sweep.Workers.QueuedPeriodic), humanInt(s.Sweep.Workers.QueuedBurst))
+						formatLine(0, "%sMax connections/worker: %s", indent, humanInt(s.Sweep.Workers.MaxProvideConnsPerWorker))
 						addBlankLine(0)
 					}
 				}
@@ -559,14 +563,34 @@ func humanFloatOrNA(val float64) string {
 	if val <= 0 {
 		return "N/A"
 	}
-	return fmt.Sprintf("%.1f", val)
+	return humanFull(val, 1)
 }
 
-func humanSI(val float64, decimals int) string {
-	v, unit := humanize.ComputeSI(val)
+func humanSI[T constraints.Float | constraints.Integer](val T, decimals int) string {
+	v, unit := humanize.ComputeSI(float64(val))
 	return fmt.Sprintf("%s%s", humanFull(v, decimals), unit)
+}
+
+func humanInt[T constraints.Integer](val T) string {
+	return humanFull(float64(val), 0)
 }
 
 func humanFull(val float64, decimals int) string {
 	return humanize.CommafWithDigits(val, decimals)
+}
+
+// provideCIDSync performs a synchronous/blocking provide operation to announce
+// the given CID to the DHT.
+//
+//   - If the accelerated DHT client is used, a DHT lookup isn't needed, we
+//     directly allocate provider records to closest peers.
+//   - If Provide.DHT.SweepEnabled=true or OptimisticProvide=true, we make an
+//     optimistic provide call.
+//   - Else we make a standard provide call (much slower).
+//
+// IMPORTANT: The caller MUST verify DHT availability using HasActiveDHTClient()
+// before calling this function. Calling with a nil or invalid router will cause
+// a panic - this is the caller's responsibility to prevent.
+func provideCIDSync(ctx context.Context, router routing.Routing, c cid.Cid) error {
+	return router.Provide(ctx, c, true)
 }
